@@ -1,4 +1,6 @@
-https://godbolt.org/z/fT6Mzjrr7
+/*
+    https://godbolt.org/z/fT6Mzjrr7
+*/
 #pragma once
 #include <coroutine>
 #include <exception>
