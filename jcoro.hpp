@@ -119,6 +119,11 @@ struct yield_awaiter {
     template<typename P>
     void await_suspend(std::coroutine_handle<P> h) const noexcept {
         auto& promise = h.promise();
+        
+        // КРИТИЧЕСКАЯ ПРОВЕРКА: Если планировщик не задан, корутина никогда не проснется.
+        // Мы используем assert, чтобы поймать это на этапе отладки.
+        assert(promise.sched != nullptr && "Попытка вызова delay() в корутине без планировщика!");
+        
         if (promise.sched) {
             promise.wake_up_tick = promise.sched->ticks_count + delay_ticks;
             promise.sched->post(std::coroutine_handle<promise_base>::from_promise(promise));
@@ -179,9 +184,7 @@ struct task_promise : promise_base, promise_return_handler<T, task_promise<T, Is
     }
 
     /**
-     * КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Проброс контекста через await_transform.
-     * Теперь родитель (this) передает свой планировщик ребенку (t) 
-     * до начала ожидания. Это избавляет от небезопасных кастов в await_suspend.
+     * Проброс контекста через await_transform.
      */
     template<typename U, bool R>
     auto await_transform(task<U, R>&& t) {
@@ -191,7 +194,6 @@ struct task_promise : promise_base, promise_return_handler<T, task_promise<T, Is
         return std::move(t);
     }
 
-    // Разрешаем ожидание delay (yield_awaiter)
     auto await_transform(yield_awaiter y) { return y; }
 };
 
@@ -217,8 +219,6 @@ struct [[nodiscard]] task {
         bool await_ready() { return !handle || handle.done(); }
 
         auto await_suspend(std::coroutine_handle<> cont) {
-            // Контекст (sched) уже проброшен через await_transform родителя.
-            // Нам остается только связать цепочку возобновления.
             handle.promise().continuation = cont;
             return handle; 
         }
@@ -247,7 +247,6 @@ struct [[nodiscard]] task {
         return awaiter{std::exchange(h, {})}; 
     }
 
-    // Запуск корневой задачи в планировщике
     void start(scheduler_interface& s) requires (IsRoot) {
         if (h) {
             h.promise().sched = &s; 
@@ -284,4 +283,3 @@ root_task spawn(task<T, false> t, F callback) {
     auto result = co_await std::move(t);
     callback(std::move(result));
 }
-
