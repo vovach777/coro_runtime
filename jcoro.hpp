@@ -1,5 +1,5 @@
 /*
-https://godbolt.org/z/nqfes9eYr
+https://godbolt.org/z/vM9xqn4Eh
 */
 #pragma once
 #include <coroutine>
@@ -24,9 +24,26 @@ https://godbolt.org/z/nqfes9eYr
 
 // --- ИНФРАСТРУКТУРА ПЛАНИРОВЩИКА ---
 
+struct promise_base;
+
+/**
+ * Интерфейс планировщика.
+ * Задачи привязаны к экземпляру, а не к глобальной переменной.
+ */
+struct scheduler_interface {
+    uint64_t ticks_count = 0;
+    virtual void post(std::coroutine_handle<promise_base> h) = 0;
+    virtual void idle() = 0;
+    virtual void on_fatal_exception(std::exception_ptr ep) = 0;
+    virtual ~scheduler_interface() = default;
+};
+
+// --- БАЗОВЫЙ ПРОМИС ---
+
 struct promise_base {
     std::coroutine_handle<> continuation{std::noop_coroutine()};
     uint64_t wake_up_tick = 0; 
+    scheduler_interface* sched = nullptr; // Контекст планировщика
 };
 
 struct TimerComparator {
@@ -35,13 +52,7 @@ struct TimerComparator {
     }
 };
 
-struct scheduler_interface {
-    uint64_t ticks_count = 0;
-    virtual void post(std::coroutine_handle<promise_base> h) = 0;
-    virtual void idle() = 0;
-    virtual void on_fatal_exception(std::exception_ptr ep) = 0;
-    virtual ~scheduler_interface() = default;
-};
+// --- КОНКРЕТНЫЙ ПЛАНИРОВЩИК ---
 
 struct manual_scheduler : scheduler_interface {
     std::deque<std::coroutine_handle<promise_base>> ready_queue;
@@ -70,9 +81,10 @@ struct manual_scheduler : scheduler_interface {
         try {
             if (ep) std::rethrow_exception(ep);
         } catch (const std::exception& e) {
-            std::cerr << "[FATAL] Root Task error: " << e.what() << std::endl;
+            std::cerr << "\n[SCHEDULER] Критическая ошибка: " << e.what() << std::endl;
+        } catch (...) {
+            std::cerr << "\n[SCHEDULER] Неизвестная ошибка!" << std::endl;
         }
-        std::terminate();
     }
 
     void run_all() {
@@ -81,123 +93,153 @@ struct manual_scheduler : scheduler_interface {
                 ready_queue.push_back(waiters_queue.top());
                 waiters_queue.pop();
             }
-            if (ready_queue.empty()) { idle(); ticks_count++; continue; }
+            if (ready_queue.empty()) { 
+                if (waiters_queue.empty()) break;
+                idle(); 
+                ticks_count++; 
+                continue; 
+            }
             auto h = ready_queue.front();
             ready_queue.pop_front();
-            if (!h.done()) h.resume();
+            
+            if (!h.done()) {
+                h.resume();
+            }
             ticks_count++;
         }
     }
 };
 
-inline manual_scheduler g_sched;
+// --- МЕХАНИЗМ ЗАДЕРЖКИ ---
 
 struct yield_awaiter {
     uint64_t delay_ticks;
     bool await_ready() const noexcept { return delay_ticks == 0; }
+
     template<typename P>
     void await_suspend(std::coroutine_handle<P> h) const noexcept {
-        h.promise().wake_up_tick = g_sched.ticks_count + delay_ticks;
-        g_sched.post(std::coroutine_handle<promise_base>::from_promise(h.promise()));
+        auto& promise = h.promise();
+        if (promise.sched) {
+            promise.wake_up_tick = promise.sched->ticks_count + delay_ticks;
+            promise.sched->post(std::coroutine_handle<promise_base>::from_promise(promise));
+        }
     }
     void await_resume() const noexcept {}
 };
 
 inline yield_awaiter delay(uint64_t ticks) { return {ticks}; }
 
-// --- УНИФИЦИРОВАННЫЙ ОБРАБОТЧИК ВОЗВРАТА ---
+// --- УНИФИЦИРОВАННЫЙ ПРОМИС ---
 
 template<typename T, typename Derived>
-struct return_handler {
+struct promise_return_handler {
     void return_value(T v) { static_cast<Derived*>(this)->set_result(std::move(v)); }
 };
 
 template<typename Derived>
-struct return_handler<void, Derived> {
+struct promise_return_handler<void, Derived> {
     void return_void() { static_cast<Derived*>(this)->set_result(); }
 };
-
-// --- ЕДИНЫЙ ШАБЛОН TASK И PROMISE ---
 
 template<typename T = void, bool IsRoot = false>
 struct task;
 
 template<typename T, bool IsRoot>
-struct task_promise : promise_base, return_handler<T, task_promise<T, IsRoot>> {
+struct task_promise : promise_base, promise_return_handler<T, task_promise<T, IsRoot>> {
     using storage_type = std::conditional_t<std::is_void_v<T>, std::monostate, T>;
     std::variant<std::monostate, storage_type, std::exception_ptr> result;
 
-    // ТО САМОЕ МЕСТО: возвращаем объект нашей задачи
     task<T, IsRoot> get_return_object() {
         return task<T, IsRoot>{std::coroutine_handle<task_promise>::from_promise(*this)};
     }
 
     std::suspend_always initial_suspend() noexcept { return {}; }
-
+    
     auto final_suspend() noexcept {
         struct final_awaiter {
-            // Если Root -> возвращаем true (await_ready), чтобы не засыпать и удалиться
-            bool await_ready() noexcept { return IsRoot; } 
+            bool await_ready() noexcept { return false; } 
             std::coroutine_handle<> await_suspend(std::coroutine_handle<task_promise> h) noexcept {
-                return h.promise().continuation;
+                return h.promise().continuation; 
             }
             void await_resume() noexcept {}
         };
-        return final_awaiter{};
+
+        if constexpr (IsRoot) return std::suspend_never{};
+        else return final_awaiter{};
     }
 
     void set_result(storage_type v = {}) { result.template emplace<1>(std::move(v)); }
     
     void unhandled_exception() noexcept {
-        if constexpr (IsRoot) g_sched.on_fatal_exception(std::current_exception());
-        else result.template emplace<2>(std::current_exception());
+        if constexpr (IsRoot) {
+            if (this->sched) this->sched->on_fatal_exception(std::current_exception());
+        } else {
+            result.template emplace<2>(std::current_exception());
+        }
     }
 
+    /**
+     * КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Проброс контекста через await_transform.
+     * Теперь родитель (this) передает свой планировщик ребенку (t) 
+     * до начала ожидания. Это избавляет от небезопасных кастов в await_suspend.
+     */
     template<typename U, bool R>
-    auto await_transform(task<U, R>&& t) { return std::move(t); }
+    auto await_transform(task<U, R>&& t) {
+        if (t.h) {
+            t.h.promise().sched = this->sched;
+        }
+        return std::move(t);
+    }
+
+    // Разрешаем ожидание delay (yield_awaiter)
     auto await_transform(yield_awaiter y) { return y; }
 };
 
-/**
- * Унифицированный Task класс.
- */
+// --- ОБЕРТКА TASK ---
+
 template<typename T, bool IsRoot>
 struct [[nodiscard]] task {
     using promise_type = task_promise<T, IsRoot>;
     std::coroutine_handle<promise_type> h;
 
     explicit task(std::coroutine_handle<promise_type> handle) : h(handle) {}
+    
     task(task&& o) noexcept : h(std::exchange(o.h, {})) {}
     task(const task&) = delete;
+    task& operator=(const task&) = delete;
 
-    ~task() { if (h) h.destroy(); }
-
-    void start() requires (IsRoot) {
-        if (h) {
-            g_sched.post(std::coroutine_handle<promise_base>::from_promise(h.promise()));
-            h = {}; 
-        }
-    }
-
-    void start(uint64_t delay_ticks) requires (IsRoot) {
-        if (h) {
-            h.promise().wake_up_tick = g_sched.ticks_count + delay_ticks;
-            g_sched.post(std::coroutine_handle<promise_base>::from_promise(h.promise()));
-            h = {}; 
-        }
+    ~task() { 
+        if (h) h.destroy(); 
     }
 
     struct awaiter {
         std::coroutine_handle<promise_type> handle;
         bool await_ready() { return !handle || handle.done(); }
+
         auto await_suspend(std::coroutine_handle<> cont) {
+            // Контекст (sched) уже проброшен через await_transform родителя.
+            // Нам остается только связать цепочку возобновления.
             handle.promise().continuation = cont;
-            return handle;
+            return handle; 
         }
+
         T await_resume() {
             auto& p = handle.promise();
-            if (p.result.index() == 2) std::rethrow_exception(std::get<2>(p.result));
-            if constexpr (!std::is_void_v<T>) return std::move(std::get<1>(p.result));
+            bool has_exc = (p.result.index() == 2);
+            std::exception_ptr exc;
+            if (has_exc) exc = std::get<2>(p.result);
+
+            using storage_t = std::conditional_t<std::is_void_v<T>, std::monostate, T>;
+            storage_t res;
+            if constexpr (!std::is_void_v<T>) {
+                if (!has_exc) res = std::move(std::get<1>(p.result));
+            }
+
+            handle.destroy();
+            handle = {};
+
+            if (has_exc) std::rethrow_exception(exc);
+            if constexpr (!std::is_void_v<T>) return std::move(res);
         }
     };
 
@@ -205,8 +247,41 @@ struct [[nodiscard]] task {
         return awaiter{std::exchange(h, {})}; 
     }
 
-    auto as_root() && requires (std::is_void_v<T> && !IsRoot) {
-        // Мы просто меняем политику (IsRoot=true) для того же адреса хендла
-        return task<void, true>{std::coroutine_handle<task_promise<void, true>>::from_address(std::exchange(h, {}).address())};
+    // Запуск корневой задачи в планировщике
+    void start(scheduler_interface& s) requires (IsRoot) {
+        if (h) {
+            h.promise().sched = &s; 
+            s.post(std::coroutine_handle<promise_base>::from_promise(h.promise()));
+            h = {}; 
+        }
+    }
+
+    void start(scheduler_interface& s, uint64_t delay_ticks) requires (IsRoot) {
+        if (h) {
+            h.promise().sched = &s;
+            h.promise().wake_up_tick = s.ticks_count + delay_ticks;
+            s.post(std::coroutine_handle<promise_base>::from_promise(h.promise()));
+            h = {}; 
+        }
     }
 };
+
+/**
+ * Псевдонимы типов.
+ */
+using root_task = task<void, true>;
+
+/**
+ * Запуск фоновой задачи.
+ */
+root_task spawn(task<void, false> t) {
+    co_await std::move(t);
+}
+
+template<typename T, typename F>
+root_task spawn(task<T, false> t, F callback) {
+    static_assert(!std::is_void_v<T>, "Используйте spawn(task) для void задач.");
+    auto result = co_await std::move(t);
+    callback(std::move(result));
+}
+
