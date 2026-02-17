@@ -331,6 +331,9 @@ int main() {
     run_test("root start without delay", test_root_start_without_delay);
     run_test("root exception after multiple delays", test_root_exception_after_multiple_delays);
     run_test("parent catches child exceptions then fails to root", test_parent_catches_multiple_child_exceptions_then_fails_to_root);
+    run_test("exception to root", test_exception_to_root);
+    run_test("root start with delay", test_root_start_with_delay);
+    run_test("root start without delay", test_root_start_without_delay);
     run_test("idle called for waiters only", test_idle_called_for_waiters_only);
     return 0;
 }
