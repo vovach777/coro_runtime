@@ -1,20 +1,20 @@
 #include "jcoro.hpp"
 // --- ТЕСТЫ ---
 
-task<void> worker(std::string name, uint64_t wait) {
+void_task worker(std::string name, uint64_t wait) {
     std::cout << "[" << name << "] Жду " << wait << " тиков...\n";
     co_await delay(wait);
-    std::cout << "[" << name << "] Проснулся на тике " << g_sched.ticks_count << "\n";
+    auto sched = co_await current_scheduler();
+    std::cout << "[" << name << "] Проснулся на тике " << sched->ticks_count << "\n";
 }
 
 int main() {
+
     std::cout << "Планировщик: Ready Queue + Priority Waiters\n";
+    manual_scheduler g_sched;
 
-    auto t1 = worker("A", 100);
-    auto t2 = worker("B", 10); 
-
-    t1.start();
-    t2.start();
+    spawn(worker("A", 100)).start(g_sched);
+    spawn(worker("B", 10)).start(g_sched);
 
     g_sched.run_all();
 

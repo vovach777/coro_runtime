@@ -24,7 +24,7 @@ struct test_scheduler : manual_scheduler {
     }
 };
 
-task<void, false> record_after(std::vector<std::string>& events, std::string name, uint64_t ticks) {
+task<void> record_after(std::vector<std::string>& events, std::string name, uint64_t ticks) {
     co_await delay(ticks);
     events.push_back(std::move(name));
 }
@@ -46,12 +46,12 @@ void test_delay_order() {
     assert((events == std::vector<std::string>{"C", "B", "A"}));
 }
 
-task<int, false> nested_value_task() {
+task<int> nested_value_task() {
     co_await delay(2);
     co_return 41;
 }
 
-task<int, false> nested_parent_task() {
+task<int> nested_parent_task() {
     auto v = co_await nested_value_task();
     co_return v + 1;
 }
@@ -67,7 +67,7 @@ void test_nested_result_propagation() {
     assert(result == 42);
 }
 
-task<int, false> nested_multi_delay_leaf(std::vector<std::string>& trace) {
+task<int> nested_multi_delay_leaf(std::vector<std::string>& trace) {
     trace.push_back("leaf-start");
     co_await delay(1);
     trace.push_back("leaf-after-delay-1");
@@ -76,7 +76,7 @@ task<int, false> nested_multi_delay_leaf(std::vector<std::string>& trace) {
     co_return 10;
 }
 
-task<int, false> nested_multi_delay_parent(std::vector<std::string>& trace) {
+task<int> nested_multi_delay_parent(std::vector<std::string>& trace) {
     trace.push_back("parent-start");
     co_await delay(1);
     trace.push_back("parent-after-delay");
@@ -105,7 +105,7 @@ void test_nested_multiple_delays_in_body() {
     }));
 }
 
-task<int, false> failing_task() {
+task<int> failing_task() {
     co_await delay(1);
     throw std::runtime_error("boom");
 }
@@ -131,7 +131,7 @@ void test_exception_to_root() {
     }
 }
 
-task<int, false> nested_throw_after_delays(std::vector<std::string>& trace) {
+task<int> nested_throw_after_delays(std::vector<std::string>& trace) {
     trace.push_back("nested-throw-start");
     co_await delay(1);
     trace.push_back("nested-throw-after-delay-1");
@@ -232,14 +232,14 @@ void test_root_exception_after_multiple_delays() {
 
 
 
-task<int, false> always_failing_child(const std::string& marker, std::vector<std::string>& trace) {
+task<int> always_failing_child(const std::string& marker, std::vector<std::string>& trace) {
     trace.push_back("child-start-" + marker);
     co_await delay(1);
     trace.push_back("child-throw-" + marker);
     throw std::runtime_error("child-fail-" + marker);
 }
 
-task<int, false> parent_catches_children_then_throws(std::vector<std::string>& trace) {
+task<int> parent_catches_children_then_throws(std::vector<std::string>& trace) {
     int recovered_sum = 0;
 
     try {

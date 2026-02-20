@@ -42,7 +42,7 @@ struct scheduler_interface {
 
 struct promise_base {
     std::coroutine_handle<> continuation{std::noop_coroutine()};
-    uint64_t wake_up_tick = 0; 
+    uint64_t wake_up_tick = 0;
     scheduler_interface* sched = nullptr; // Контекст планировщика
 };
 
@@ -56,8 +56,8 @@ struct TimerComparator {
 
 struct manual_scheduler : scheduler_interface {
     std::deque<std::coroutine_handle<promise_base>> ready_queue;
-    std::priority_queue<std::coroutine_handle<promise_base>, 
-                        std::vector<std::coroutine_handle<promise_base>>, 
+    std::priority_queue<std::coroutine_handle<promise_base>,
+                        std::vector<std::coroutine_handle<promise_base>>,
                         TimerComparator> waiters_queue;
 
     void post(std::coroutine_handle<promise_base> h) override {
@@ -93,15 +93,15 @@ struct manual_scheduler : scheduler_interface {
                 ready_queue.push_back(waiters_queue.top());
                 waiters_queue.pop();
             }
-            if (ready_queue.empty()) { 
+            if (ready_queue.empty()) {
                 if (waiters_queue.empty()) break;
-                idle(); 
-                ticks_count++; 
-                continue; 
+                idle();
+                ticks_count++;
+                continue;
             }
             auto h = ready_queue.front();
             ready_queue.pop_front();
-            
+
             if (!h.done()) {
                 h.resume();
             }
@@ -119,20 +119,35 @@ struct yield_awaiter {
     template<typename P>
     void await_suspend(std::coroutine_handle<P> h) const noexcept {
         auto& promise = h.promise();
-        
+
         // КРИТИЧЕСКАЯ ПРОВЕРКА: Если планировщик не задан, корутина никогда не проснется.
         // Мы используем assert, чтобы поймать это на этапе отладки.
         assert(promise.sched != nullptr && "Попытка вызова delay() в корутине без планировщика!");
-        
-        if (promise.sched) {
-            promise.wake_up_tick = promise.sched->ticks_count + delay_ticks;
-            promise.sched->post(std::coroutine_handle<promise_base>::from_promise(promise));
-        }
+
+        promise.wake_up_tick = promise.sched->ticks_count + delay_ticks;
+        promise.sched->post(std::coroutine_handle<promise_base>::from_promise(promise));
     }
     void await_resume() const noexcept {}
 };
 
 inline yield_awaiter delay(uint64_t ticks) { return {ticks}; }
+
+// --- ПОЛУЧЕНИЕ ПЛАНИРОВЩИКА ---
+
+struct get_scheduler_awaiter {
+    scheduler_interface* s = nullptr;
+    bool await_ready() const noexcept { return false; }
+
+    template<typename P>
+    bool await_suspend(std::coroutine_handle<P> h) noexcept {
+        s = h.promise().sched;
+        return false; // Resume immediately
+    }
+
+    scheduler_interface* await_resume() const noexcept { return s; }
+};
+
+inline get_scheduler_awaiter current_scheduler() { return {}; }
 
 // --- УНИФИЦИРОВАННЫЙ ПРОМИС ---
 
@@ -159,12 +174,12 @@ struct task_promise : promise_base, promise_return_handler<T, task_promise<T, Is
     }
 
     std::suspend_always initial_suspend() noexcept { return {}; }
-    
+
     auto final_suspend() noexcept {
         struct final_awaiter {
-            bool await_ready() noexcept { return false; } 
+            bool await_ready() noexcept { return false; }
             std::coroutine_handle<> await_suspend(std::coroutine_handle<task_promise> h) noexcept {
-                return h.promise().continuation; 
+                return h.promise().continuation;
             }
             void await_resume() noexcept {}
         };
@@ -174,7 +189,7 @@ struct task_promise : promise_base, promise_return_handler<T, task_promise<T, Is
     }
 
     void set_result(storage_type v = {}) { result.template emplace<1>(std::move(v)); }
-    
+
     void unhandled_exception() noexcept {
         if constexpr (IsRoot) {
             if (this->sched) this->sched->on_fatal_exception(std::current_exception());
@@ -194,7 +209,16 @@ struct task_promise : promise_base, promise_return_handler<T, task_promise<T, Is
         return std::move(t);
     }
 
-    auto await_transform(yield_awaiter y) { return y; }
+    // auto await_transform(yield_awaiter y) { return y; }
+
+    // auto await_transform(get_scheduler_awaiter g) { return g; }
+    // Разрешаем co_await для произвольных типов (например, uv_wait_awaiter)
+    template<typename A>
+    decltype(auto) await_transform(A a) {
+        return a;
+    }
+
+
 };
 
 // --- ОБЕРТКА TASK ---
@@ -205,13 +229,13 @@ struct [[nodiscard]] task {
     std::coroutine_handle<promise_type> h;
 
     explicit task(std::coroutine_handle<promise_type> handle) : h(handle) {}
-    
+
     task(task&& o) noexcept : h(std::exchange(o.h, {})) {}
     task(const task&) = delete;
     task& operator=(const task&) = delete;
 
-    ~task() { 
-        if (h) h.destroy(); 
+    ~task() {
+        if (h) h.destroy();
     }
 
     struct awaiter {
@@ -220,7 +244,7 @@ struct [[nodiscard]] task {
 
         auto await_suspend(std::coroutine_handle<> cont) {
             handle.promise().continuation = cont;
-            return handle; 
+            return handle;
         }
 
         T await_resume() {
@@ -243,15 +267,15 @@ struct [[nodiscard]] task {
         }
     };
 
-    auto operator co_await() && requires (!IsRoot) { 
-        return awaiter{std::exchange(h, {})}; 
+    auto operator co_await() && requires (!IsRoot) {
+        return awaiter{std::exchange(h, {})};
     }
 
     void start(scheduler_interface& s) requires (IsRoot) {
         if (h) {
-            h.promise().sched = &s; 
+            h.promise().sched = &s;
             s.post(std::coroutine_handle<promise_base>::from_promise(h.promise()));
-            h = {}; 
+            h = {};
         }
     }
 
@@ -260,7 +284,7 @@ struct [[nodiscard]] task {
             h.promise().sched = &s;
             h.promise().wake_up_tick = s.ticks_count + delay_ticks;
             s.post(std::coroutine_handle<promise_base>::from_promise(h.promise()));
-            h = {}; 
+            h = {};
         }
     }
 };
@@ -269,11 +293,12 @@ struct [[nodiscard]] task {
  * Псевдонимы типов.
  */
 using root_task = task<void, true>;
+using void_task = task<void>;
 
 /**
  * Запуск фоновой задачи.
  */
-root_task spawn(task<void, false> t) {
+root_task spawn(void_task t) {
     co_await std::move(t);
 }
 
